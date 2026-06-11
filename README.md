@@ -174,29 +174,5 @@ begin
 end;
 ```
 ### Writing archive
-```Pascal
- procedure TMainForm.PackFilesClick(Sender: TObject);
-var
-  Arch: I7zOutArchive;
-begin
-  Arch := CreateOutArchive(CLSID_CFormat7z);
-  // add a file
-  Arch.AddFile('c:\test.bin', 'folder\test.bin');
-  // add files using willcards and recursive search
-  Arch.AddFiles('c:\test', 'folder', '*.pas;*.dfm', true);
-  // add a stream
-  Arch.AddStream(aStream, soReference, faArchive, CurrentFileTime, CurrentFileTime, 'folder\test.bin', false, false);
-  // compression level
-  SetCompressionLevel(Arch, 5);
-  // compression method if <> LZMA
-  SevenZipSetCompressionMethod(Arch, m7BZip2);
-  // add a progress bar ...
-  Arch.SetProgressCallback(...);
-  // set a password if necessary
-  Arch.SetPassword('password');
-  // Save to file
-  Arch.SaveToFile('c:\test.zip');
-  // or a stream
-  Arch.SaveToStream(aStream);
-end;
-```
+see Demo2
+
