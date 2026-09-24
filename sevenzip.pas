@@ -16,6 +16,23 @@
 // Original code at https://code.google.com/archive/p/d7zip/
 // Uploaded to GitHub at https://github.com/danielmarschall/d7zip
 
+// Current version by Christian Allen, 02 September 2026 with the following changes:
+// - Added support for multi-volume 7z archives (.7z.001, .002, ...) via the 7-Zip Split Handler.
+//   Manage multi-volume files just like single-volume files. The component handles everything.
+//   Simply create the I7zInArchive component, then open the first file.
+//   Important: only the **first file** should be specified in the `OpenFile` command.
+// - Fixed and validated handling of single- and multi-volume RAR4/RAR5 archives.
+// - Improved HRESULT and COM error handling, with explicit error propagation during opening and extraction (FOperationResult).
+// - Added extraction counters: ExtractedFileCount, FailedFileCount, and DeletedFileCount.
+// - Added handling for files partially created during a failed extraction, ensuring the affected files are deleted.
+// - Improved stream lifecycle management (TFileStream / T7zStream) and object ownership to prevent memory leaks or double-frees.
+// - Added generic handling for single-stream formats (BZip2, XZ, GZip, etc.) when kpidPath is not provided by the 7-Zip handler: the output name is derived from the source filename.
+// - Strengthened internal state reset during Close and prior to new extraction operations.
+// - OpenFile and OpenStream now ensure a clean state is restored in the event of an opening error.
+// - Added additional checks on interfaces and results returned by the 7-Zip SDK.
+// - New demo: see demo2 folder.
+// These changes have been validated with ZIP/CBZ, 7z (including multi-volume), RAR4/RAR5 (including multi-volume), TAR, WIM, GZ, BZip2, XZ, CAB, ISO, CBR, and CBT archives.
+
 // Current version by Christian Allen, 08 June 2026 with the following changes:
 // - Added support for the following file extensions:
 // 	- in TArchiveFactory.CreateInArchive: cbz, cb7, cbr, bz2, xz, 001
@@ -556,7 +573,8 @@ type
   IArchiveOpenVolumeCallback = interface
   ['{23170F69-40C1-278A-0000-000600300000}']
     function GetProperty(propID: PROPID; var value: OleVariant): HRESULT; stdcall;
-    function GetStream(const name: PWideChar; var inStream: IInStream): HRESULT; stdcall;
+//	 function GetStream(const name: PWideChar; var inStream: IInStream): HRESULT; stdcall;
+    function GetStream(const name: PWideChar; out inStream: IInStream): HRESULT; stdcall; // CAL 02/09/2026
   end;
 
   IInArchiveGetStream = interface
@@ -1082,6 +1100,11 @@ type
     procedure OpenStream(stream: IInStream); stdcall;
     procedure Close; stdcall;
     function GetNumberOfItems: UInt32; stdcall;
+    // CAL 02/09/2026 (begin)
+    function GetExtractedFileCount: UInt32; stdcall;
+    function GetFailedFileCount: UInt32; stdcall;
+    function GetDeletedFileCount: UInt32; stdcall;
+    // CAL 02/09/2026 (end)
     function GetItemPath(const index: integer): UnicodeString; stdcall;
     function GetItemName(const index: integer): UnicodeString; stdcall;
     function GetItemSize(const index: integer): Int64; stdcall;
@@ -1091,6 +1114,7 @@ type
     function GetItemIsFolder(const index: integer): boolean; stdcall;
     function GetInArchive: IInArchive;
     procedure ExtractItem(const item: UInt32; Stream: TStream; test: longbool); stdcall;
+    procedure ExtractItemToPath(const item: UInt32; const path: string; test: longbool); stdcall; // CAL 02/09/2026
     procedure ExtractItems(items: PCardArray; count: UInt32; test: longbool;
       sender: pointer; callback: T7zGetStreamCallBack); stdcall;
     procedure ExtractAll(test: longbool; sender: pointer; callback: T7zGetStreamCallBack); stdcall;
@@ -1102,6 +1126,11 @@ type
     function GetClassId: TGUID;
     property ClassId: TGUID read GetClassId write SetClassId;
     property NumberOfItems: UInt32 read GetNumberOfItems;
+    // CAL 02/09/2026 (begin)
+    property ExtractedFileCount: UInt32 read GetExtractedFileCount;
+    property FailedFileCount: UInt32 read GetFailedFileCount;
+    property DeletedFileCount: UInt32 read GetDeletedFileCount;
+    // CAL 02/09/2026 (end)
     property ItemPath[const index: integer]: UnicodeString read GetItemPath;
     property ItemName[const index: integer]: UnicodeString read GetItemName;
     property ItemSize[const index: integer]: Int64 read GetItemSize;
@@ -1331,8 +1360,11 @@ end;
 
 procedure RINOK(const hr: HRESULT);
 begin
-  if hr <> S_OK then
-	 raise Exception.Create(SysErrorMessage(Cardinal(hr)));
+//	if hr <> S_OK then
+//		raise Exception.Create(SysErrorMessage(Cardinal(hr)));
+	// 02/09/2026 - CAL
+	if failed(hr) then
+		raise Exception.CreateFmt('HRESULT = %.8x (%s)', [Cardinal(hr), SysErrorMessage(Cardinal(hr))] );
 end;
 
 { -----------------------------------------------------------------------------
@@ -1364,10 +1396,10 @@ end;
  08/06/2026 - CAL
  Using OleVariant and then casting (see above) worked "by chance" on older Delphi Win32 systems.
  However:
- â€¢ Delphi 12,...
- â€¢ Win64,
- â€¢ modern memory alignment,
- â€¢ stricter ARC/RTTI/variant management,
+ • Delphi 12,...
+ • Win64,
+ • modern memory alignment,
+ • stricter ARC/RTTI/variant management,
  => make this casting method risky.
  Now use TPropVariant instead
 ----------------------------------------------------------------------------- }
@@ -1567,6 +1599,18 @@ type
     IArchiveOpenSetSubArchiveName)
   private
     FInArchive: IInArchive;
+    // CAL 02/09/2026 (begin)
+    FSplitArchive: IInArchive;
+    FOpenFileName: string;
+    FOperationResult: NExtOperationResult;
+    FExtractedFileCount: UInt32;			// files successfully processed
+    FFailedFileCount: UInt32;				// files with errors
+    FCurrentExtractIsFile: Boolean;
+    FFailedExtractFiles: TStringList;
+    FDeletedFileCount: UInt32;
+    FCurrentExtractPath: string;
+    FCurrentExtractResultReported: boolean;
+    // CAL 02/09/2026 (end)
     FPasswordCallback: T7zPasswordCallback;
     FPasswordSender: Pointer;
     FProgressCallback: T7zProgressCallback;
@@ -1581,12 +1625,25 @@ type
     FExtractPath: string;
     function GetInArchive: IInArchive;
     function GetItemProp(const Item: UInt32; prop: PROPID): OleVariant;
+    // CAL 02/09/2026 (begin)
+    function CreateFileInStream(const FileName: string): IInStream;
+    procedure OpenSplitFile;
+    procedure CheckOperationResult;
+    procedure ResetCounters;
+    procedure DeleteFailedFiles;
+    function GetExtractFilePath(const Index: UInt32): string;
+    // CAL 02/09/2026 (end)
   protected
     // I7zInArchive
     procedure OpenFile(const filename: string); stdcall;
     procedure OpenStream(stream: IInStream); stdcall;
     procedure Close; stdcall;
     function GetNumberOfItems: UInt32; stdcall;
+    // CAL 02/09/2026 (begin)
+    function GetExtractedFileCount: UInt32; stdcall;
+    function GetFailedFileCount: UInt32; stdcall;
+    function GetDeletedFileCount: UInt32; stdcall;
+    // CAL 02/09/2026 (end)
     function GetItemPath(const index: integer): UnicodeString; stdcall;
     function GetItemName(const index: integer): UnicodeString; stdcall;
     function GetItemSize(const index: integer): Int64; stdcall;
@@ -1617,7 +1674,8 @@ type
     function CryptoGetTextPassword(var password: TBStr): HRESULT; stdcall;
     // IArchiveOpenVolumeCallback
     function GetProperty(propID: PROPID; var value: OleVariant): HRESULT; overload; stdcall;
-    function GetStream(const name: PWideChar; var inStream: IInStream): HRESULT; overload; stdcall;
+//	 function GetStream(const name: PWideChar; var inStream: IInStream): HRESULT; overload; stdcall;
+    function GetStream(const name: PWideChar; out inStream: IInStream): HRESULT; overload; stdcall; // CAL 02/09/2026
     // IArchiveOpenSetSubArchiveName
     function SetSubArchiveName(name: PWideChar): HRESULT; stdcall;
 
@@ -1726,7 +1784,7 @@ begin
   else if SameText(FileType, 'xz') then			// CAL - 08/06/2026
     Result := sevenzip.CreateInArchive(CLSID_CFormatXz, lib)
   else if SameText(FileType, '001') then			// CAL - 08/06/2026
-	 Result := sevenzip.CreateInArchive(CLSID_CFormatSplit, lib)
+    Result := sevenzip.CreateInArchive(CLSID_CFormat7z, lib) // CAL 02/09/2026
   else
     raise Exception.Create('Unsupported file type: ' + FileType);
 end;
@@ -1894,12 +1952,22 @@ end;
 
 { T7zInArchive }
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.Close; stdcall;
 begin
-  FPasswordIsDefined := false;
-  FSubArchiveMode := false;
-  FInArchive.Close;
-  FInArchive := nil;
+	FPasswordIsDefined := False;
+	FSubArchiveMode := False;
+	ResetCounters;
+	if FInArchive <> nil then
+	begin
+		FInArchive.Close;
+		FInArchive := nil;
+	end;
+	// Important! After FInArchive
+	FSplitArchive := nil;
+	FOpenFileName := '';
 end;
 
 constructor T7zInArchive.Create(const lib: string);
@@ -1911,11 +1979,18 @@ begin
   FSubArchiveMode := false;
   FExtractCallBack := nil;
   FExtractSender := nil;
+  FFailedExtractFiles := TStringList.Create;		// CAL 02/09/2026
 end;
 
 destructor T7zInArchive.Destroy;
 begin
   FInArchive := nil;
+  // CAL 02/09/2026 (begin)
+  FSplitArchive := nil;
+  if assigned(FFailedExtractFiles) then
+    FFailedExtractFiles.Free;
+  FFailedExtractFiles := nil;
+  // CAL 02/09/2026 (end)
   inherited;
 end;
 
@@ -1936,26 +2011,289 @@ begin
   RINOK(FInArchive.GetNumberOfItems(Result));
 end;
 
-procedure T7zInArchive.OpenFile(const filename: string); stdcall;
-var
-  strm: IInStream;
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Files successfully processed.
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetExtractedFileCount: UInt32;
 begin
-  strm := T7zStream.Create(TFileStream.Create(filename, fmOpenRead or fmShareDenyNone), soOwned);
-  try
-    RINOK(
-      InArchive.Open(
-        strm,
-          @MAXCHECK, self as IArchiveOpenCallBack
-        )
-      );
-  finally
-    strm := nil;
-  end;
+	result:=FExtractedFileCount;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Files with errors.
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetFailedFileCount: UInt32;
+begin
+	result:=FFailedFileCount;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Deleted files.
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetDeletedFileCount: UInt32;
+begin
+	Result := FDeletedFileCount;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Reset result and counters before extractions.
+----------------------------------------------------------------------------- }
+procedure T7zInArchive.ResetCounters;
+begin
+	FOperationResult := kOK;
+	FExtractedFileCount := 0;
+	FFailedFileCount := 0;
+	FDeletedFileCount := 0;
+	FCurrentExtractPath := '';
+	FCurrentExtractIsFile := False;
+	FCurrentExtractResultReported := False;
+	if assigned(FFailedExtractFiles) then
+		FFailedExtractFiles.Clear;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Deletes files that have been partially extracted.
+----------------------------------------------------------------------------- }
+procedure T7zInArchive.DeleteFailedFiles;
+var
+	I: Integer;
+begin
+	if assigned(FFailedExtractFiles)=false then
+		exit;
+	for I:=0 to FFailedExtractFiles.Count-1 do
+	begin
+		if DeleteFile(pchar(FFailedExtractFiles[I])) then
+			Inc(FDeletedFileCount);
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Retrieves the output name stored in the archive.
+ If empty, retrieves the output name from the archive name.
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetExtractFilePath(const Index: UInt32): string;
+var
+	Path: string;
+	FileName: string;
+begin
+	Path := GetItemPath(Index);
+	// Normal case: the handler provides kpidPath.
+	if Path <> '' then
+		Exit(Path);
+
+	// Some "single-stream" formats (BZ2, XZ, GZ, ...)
+	// do not provide a kpidPath.
+	if FOpenFileName = '' then
+		Exit('');
+	FileName := ExtractFileName(FOpenFileName);
+	// Remove the container/compression extension.
+	if SameText(ExtractFileExt(FileName), '.bz2') or SameText(ExtractFileExt(FileName), '.bzip2') or
+			SameText(ExtractFileExt(FileName), '.xz') or SameText(ExtractFileExt(FileName), '.gz') then
+		FileName := ChangeFileExt(FileName, '');
+	Result := FileName;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Le FileStream := nil est important : puisque T7zStream reçoit soOwned, il devient propriétaire du TFileStream.
+ Donc :
+ création TFileStream
+		 ?
+ T7zStream prend ownership
+		 ?
+ FileStream := nil
+		 ?
+ T7zStream libérera le TFileStream
+ En cas d'exception avant le transfert de propriété, le finally libère le TFileStream
+----------------------------------------------------------------------------- }
+function T7zInArchive.CreateFileInStream(const FileName: string): IInStream;
+var
+	FileStream: TFileStream;
+begin
+	FileStream := nil;
+	try
+		FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+		Result := T7zStream.Create(FileStream, soOwned, FileName) as IInStream;
+		FileStream := nil;
+	finally
+		FileStream.Free;
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Note: The RAR handler itself handles volumes and must use IArchiveOpenVolumeCallback
+ to request the next file. There is no need to call OpenSplitFile for these files.
+------------------------------------------------------------------------------ }
+procedure T7zInArchive.OpenFile(const filename: string); stdcall;
+var
+	strm: IInStream;
+	hr: HRESULT;
+begin
+	// The caller can still do this:
+	// try
+	//   Arch.OpenFile(...);
+	//   Arch.ExtractTo(...);
+	// finally
+	//   Arch.Close;
+	// end;
+	// but they can also directly reopen another archive.
+	Close;
+	try
+		FOpenFileName := ExpandFileName(filename);
+		// .7z.001 = Multi-volume 7-Zip archive.
+		if SameText(copy(FOpenFileName,length(FOpenFileName)-6), '.7z.001') then
+		begin
+			OpenSplitFile;
+			Exit;
+		end;
+
+		// Standard case: simple archive.
+		strm := CreateFileInStream(FOpenFileName);
+
+		try
+			hr := InArchive.Open(strm, @MAXCHECK, Self as IArchiveOpenCallback);
+			// Important:
+			// Here, we do not treat S_FALSE as a specific error. If IInArchive.Open returns S_FALSE,
+			// Failed(S_FALSE) is false, so the code continues.
+			// This is exactly the distinction we want:
+			// - S_OK      ? success
+			// - S_FALSE   ? not an HRESULT error
+			// - E_xxx     ? error
+			if failed(hr) then
+			begin
+				raise Exception.CreateFmt('IInArchive.Open HRESULT = %.8x (%s)',
+					[Cardinal(hr), SysErrorMessage(Cardinal(hr))] );
+			end;
+		finally
+			strm := nil;
+		end;
+
+	except
+		Close;
+		raise;
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Used only for multi-volume 7z archives.
+----------------------------------------------------------------------------- }
+procedure T7zInArchive.OpenSplitFile;
+var
+	SplitStream: IInStream;
+	SeqStream: ISequentialInStream;
+	LogicalStream: IInStream;
+	SplitGetStream: IInArchiveGetStream;
+	HR: HRESULT;
+begin
+
+	// ------------------------------------------------------------
+	// 1. Création du handler Split
+	// ------------------------------------------------------------
+	FSplitArchive := nil;
+	CreateObject(CLSID_CFormatSplit, IInArchive, FSplitArchive);
+	if FSplitArchive = nil then
+	begin
+		raise Exception.Create('Impossible de créer le Split handler');
+	end;
+
+	// ------------------------------------------------------------
+	// 2. Ouverture du .001
+	// ------------------------------------------------------------
+	SplitStream := CreateFileInStream(FOpenFileName);
+	HR := FSplitArchive.Open(SplitStream, nil, Self as IArchiveOpenCallback);
+	if Failed(HR) then
+	begin
+		raise Exception.CreateFmt('Split handler: IInArchive.Open HRESULT = %.8x', [Cardinal(HR)]);
+	end;
+
+	// ------------------------------------------------------------
+	// 3. Récupération du flux logique concaténé
+	// ------------------------------------------------------------
+	SplitGetStream := FSplitArchive as IInArchiveGetStream;
+	SeqStream := nil;
+	HR := SplitGetStream.GetStream(0, SeqStream);
+	if Failed(HR) then
+	begin
+		raise Exception.CreateFmt('Split handler: GetStream(0) HRESULT = %.8x', [Cardinal(HR)]);
+	end;
+	if SeqStream = nil then
+	begin
+		raise Exception.Create('Split handler: GetStream(0) a retourné NIL');
+	end;
+
+	// ------------------------------------------------------------
+	// 4. Le flux doit supporter IInStream
+	// ------------------------------------------------------------
+	LogicalStream := nil;
+	if not Supports(SeqStream, IInStream, LogicalStream) then
+	begin
+		raise Exception.Create('Split handler: le flux ne supporte pas IInStream');
+	end;
+
+	// ------------------------------------------------------------
+	// 5. Création du véritable handler 7z
+	// ------------------------------------------------------------
+	FInArchive := nil;
+	CreateObject(CLSID_CFormat7z, IInArchive, FInArchive);
+	if FInArchive = nil then
+	begin
+		raise Exception.Create('Impossible de créer le handler 7z');
+	end;
+
+	// ------------------------------------------------------------
+	// 6. Ouverture du flux concaténé par le handler 7z
+	// ------------------------------------------------------------
+	HR := FInArchive.Open(LogicalStream, @MAXCHECK, Self as IArchiveOpenCallback);
+	if Failed(HR) then
+	begin
+		raise Exception.CreateFmt('7z handler: IInArchive.Open HRESULT = %.8x', [Cardinal(HR)]);
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ Control function for extractions.
+----------------------------------------------------------------------------- }
+procedure T7zInArchive.CheckOperationResult;
+begin
+	case FOperationResult of
+		kOK: Exit;
+		kUnSupportedMethod: raise Exception.Create('Unsupported compression method');
+		kDataError: raise Exception.Create('Data error during decompression');
+		kCRCError: raise Exception.Create('CRC error during decompression');
+		kUnavailable: raise Exception.Create('Data unavailable during decompression');
+		kUnexpectedEnd: raise Exception.Create('Unexpected end of data during decompression');
+		kDataAfterEnd: raise Exception.Create('Data present after the end of the archive');
+		kIsNotArc: raise Exception.Create('The file is not an archive');
+		kHeadersError: raise Exception.Create('Error in archive headers');
+		kWrongPassword: raise Exception.Create('Incorrect password');
+	else
+		raise Exception.CreateFmt('Unknown decompression error: %d', [Integer(FOperationResult)]);
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.OpenStream(stream: IInStream); stdcall;
 begin
-  RINOK(InArchive.Open(stream, @MAXCHECK, self as IArchiveOpenCallBack));
+	Close;
+	try
+		RINOK( InArchive.Open(stream, @MAXCHECK, Self as IArchiveOpenCallback) );
+	except
+		// If InArchive.Open(...) fails after partially initializing the handler,
+		// we do not want to leave FInArchive in a partially open state.
+		Close;
+		raise;
+	end;
 end;
 
 function T7zInArchive.GetItemAttributes(const index: integer): DWORD;
@@ -1971,72 +2309,132 @@ end;
 function T7zInArchive.GetItemProp(const Item: UInt32;
   prop: PROPID): OleVariant;
 begin
-  FInArchive.GetProperty(Item, prop, Result);
+  RINOK(FInArchive.GetProperty(Item, prop, Result)); // CAL - 02/09/2026 - to secure calls to GetItemProp()
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.ExtractItem(const item: UInt32; Stream: TStream; test: longbool); stdcall;
 begin
-  FStream := Stream;
-  try
-    if test then
-      RINOK(FInArchive.Extract(@item, 1, 1, self as IArchiveExtractCallback)) else
-      RINOK(FInArchive.Extract(@item, 1, 0, self as IArchiveExtractCallback));
-  finally
-    FStream := nil;
-  end;
+	FStream := Stream;
+	ResetCounters;											// Reset result and counters before each extraction
+	try
+		if test then
+			RINOK(FInArchive.Extract(@item, 1, 1, self as IArchiveExtractCallback))
+		else
+			RINOK(FInArchive.Extract(@item, 1, 0, self as IArchiveExtractCallback));
+		CheckOperationResult;
+	finally
+		FStream := nil;
+		FCurrentExtractPath := '';
+	end;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.ExtractItemToPath(const item: UInt32; const path: string; test: longbool); stdcall;
 begin
-  FExtractPath := IncludeTrailingPathDelimiter(path);
-  try
-    if test then
-      RINOK(FInArchive.Extract(@item, 1, 1, self as IArchiveExtractCallback)) else
-      RINOK(FInArchive.Extract(@item, 1, 0, self as IArchiveExtractCallback));
-  finally
-    FExtractPath := '';
-  end;
+	FExtractPath := IncludeTrailingPathDelimiter(path);
+	ResetCounters;											// Reset result and counters before each extraction
+	try
+		try
+			if test then
+				RINOK(FInArchive.Extract(@item, 1, 1, self as IArchiveExtractCallback))
+			else
+				RINOK(FInArchive.Extract(@item, 1, 0, self as IArchiveExtractCallback));
+		finally
+			DeleteFailedFiles;							// Deletes files that have been partially extracted
+		end;
+		CheckOperationResult;
+	finally
+		FExtractPath := '';
+		FCurrentExtractPath := '';
+	end;
 end;
 
-function T7zInArchive.GetStream(index: UInt32;
-  var outStream: ISequentialOutStream; askExtractMode: NAskMode): HRESULT;
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetStream(index: UInt32; var outStream: ISequentialOutStream;
+	askExtractMode: NAskMode): HRESULT;
 var
-  path: string;
+	path: string;
+	FileStream: TFileStream;
+	WriteTime: TDateTime;
 begin
-  try
-    if askExtractMode = kExtract then
-      if FStream <> nil then
-        outStream := T7zStream.Create(FStream, soReference) as ISequentialOutStream else
-      if assigned(FExtractCallback) then
-      begin
-        Result := FExtractCallBack(FExtractSender, index, outStream);
-        Exit;
-      end else
-      if FExtractPath <> '' then
-      begin
-        if not GetItemIsFolder(index) then
-        begin
-          path := FExtractPath + GetItemPath(index);
-          ForceDirectories(ExtractFilePath(path));
-          outStream := T7zStream.Create(TFileStream.Create(path, fmCreate), soOwned, path, GetItemWriteTime(index));
-        end
-        else
-        begin
-          path := FExtractPath + GetItemPath(index);
-          ForceDirectories(path);
-        end;
-        SetFileAttributes(PChar(path), GetItemAttributes(index));
-      end;
-    Result := S_OK;
-  except
-    // We must not throw an Delphi exception, because 7z.dll cannot handle it
-    // (the unhandled Delphi Exception will be forwarded as 0x0eedfade and crashes
-    // the calling process without possibility of recovery).
-    on E: EAbort do
-      Result := E_ABORT
-    else
-      Result := E_FAIL;
-  end;
+	try
+		FCurrentExtractIsFile := not GetItemIsFolder(index);
+		FCurrentExtractPath := '';
+		FCurrentExtractResultReported := False;
+		if askExtractMode = kExtract then
+		begin
+			if FStream <> nil then
+				outStream := T7zStream.Create(FStream, soReference) as ISequentialOutStream
+			else if assigned(FExtractCallback) then
+			begin
+				Result := FExtractCallBack(FExtractSender, index, outStream);
+				exit;
+			end else if FExtractPath <> '' then
+			begin
+				if not GetItemIsFolder(index) then
+				begin
+//					path := FExtractPath + GetItemPath(index);
+					path := GetExtractFilePath(index);
+					if path = '' then
+						raise Exception.Create('Unable to determine the output file name');
+					path := IncludeTrailingPathDelimiter(FExtractPath) + path;
+					ForceDirectories(ExtractFilePath(path));
+					FCurrentExtractPath := path;
+//					outStream := T7zStream.Create(TFileStream.Create(path, fmCreate), soOwned, path, GetItemWriteTime(index));
+					FileStream := nil;
+					try
+						FileStream := TFileStream.Create(path, fmCreate);
+						WriteTime := GetItemWriteTime(index); // possible exception here
+						outStream := T7zStream.Create(FileStream, soOwned, path, WriteTime); // possible exception here
+						// soOwned means that T7zStream takes ownership of the TFileStream.
+						// Setting FileStream := nil is intentional: it signals to the finally block
+						// that ownership has been transferred.
+						FileStream := nil;
+					finally
+						FileStream.Free;
+					end;
+				end else begin
+//					path := FExtractPath + GetItemPath(index);
+					path := GetExtractFilePath(index);
+					if path = '' then
+						raise Exception.Create('Unable to determine the output file name');
+					path := IncludeTrailingPathDelimiter(FExtractPath) + path;
+					ForceDirectories(path);
+				end;
+				// I don't see the point of replicating the file attributes.
+				// If you want to re-enable this line, you will need to check
+				// whether the file originated from a Windows or Unix OS — using something like
+				// FInArchive.GetProperty(Index, kpidHostOS, value) - and then handle
+				// the different cases or simply call SetFileAttributes if the host OS is Windows.
+//				SetFileAttributes(PChar(path), GetItemAttributes(index));
+			end;
+		end;
+		Result := S_OK;
+	except
+		// We must not throw an Delphi exception, because 7z.dll cannot handle it
+		// (the unhandled Delphi Exception will be forwarded as 0x0eedfade and crashes
+		// the calling process without possibility of recovery).
+		// The error may be due to access denied, a full disk, an invalid path, a locked file, etc.
+		// Therefore, its nature is not changed here; the HRESULT returned by IInArchive.Extract() will be handled by the caller.
+		// If the target file was already created, keep its path so the caller can delete it.
+		if FCurrentExtractIsFile then
+		begin
+			Inc(FFailedFileCount);
+			if (FCurrentExtractPath <> '') and (FFailedExtractFiles.IndexOf(FCurrentExtractPath) < 0) then
+				FFailedExtractFiles.Add(FCurrentExtractPath);
+		end;
+		if ExceptObject is EAbort then
+			Result := E_ABORT
+		else
+			Result := E_FAIL;
+	end;
 end;
 
 function T7zInArchive.PrepareOperation(askExtractMode: NAskMode): HRESULT;
@@ -2066,10 +2464,35 @@ begin
   Result := S_OK;
 end;
 
-function T7zInArchive.SetOperationResult(
-  resultEOperationResult: NExtOperationResult): HRESULT;
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ To report an error if the requested volume is missing, incorrect, or truncated.
+ You should not do this:
+ if resultEOperationResult <> kOK then
+   raise Exception...
+ inside this function.
+ The boundary between 7z.dll and the Delphi callback must remain exception-free. Error handling
+ should take place after `IInArchive.Extract()` returns, on the Delphi API side.
+----------------------------------------------------------------------------- }
+function T7zInArchive.SetOperationResult(resultEOperationResult: NExtOperationResult): HRESULT;
 begin
-  Result := S_OK;
+	if FCurrentExtractIsFile and not FCurrentExtractResultReported then
+	begin
+		if resultEOperationResult = kOK then
+			Inc(FExtractedFileCount)
+		else
+			Inc(FFailedFileCount);
+		FCurrentExtractResultReported := True;		// to avoid double counting
+	end;
+	// Retain the first error encountered:
+	if resultEOperationResult <> kOK then
+	begin
+		if FOperationResult = kOK then
+			FOperationResult := resultEOperationResult;
+		if (FCurrentExtractPath <> '') and (FFailedExtractFiles.IndexOf(FCurrentExtractPath) < 0) then
+			FFailedExtractFiles.Add(FCurrentExtractPath);
+	end;
+	Result := S_OK;
 end;
 
 function T7zInArchive.SetTotal(total: UInt64): HRESULT;
@@ -2134,16 +2557,74 @@ begin
   end;
 end;
 
-function T7zInArchive.GetProperty(propID: PROPID;
-  var value: OleVariant): HRESULT;
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetProperty(propID: PROPID; var value: OleVariant): HRESULT;
 begin
-  Result := S_OK;
+	try
+		case propID of
+			kpidName:
+			begin
+				value := ExtractFileName(FOpenFileName);
+				Result := S_OK;
+			end;
+		else begin
+				Result := E_NOINTERFACE;
+			end;
+		end;
+	except
+		on E: Exception do
+		begin
+			Result := E_FAIL;
+		end;
+	end;
 end;
 
-function T7zInArchive.GetStream(const name: PWideChar;
-  var inStream: IInStream): HRESULT;
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zInArchive.GetStream(const name: PWideChar; out inStream: IInStream): HRESULT;
+var
+	FileName: string;
+	BaseDir: string;
 begin
-  Result := S_OK;
+	inStream := nil;
+
+	try
+		if name = nil then
+		begin
+			Result := E_INVALIDARG;
+			Exit;
+		end;
+
+		FileName := string(name);
+		BaseDir := IncludeTrailingPathDelimiter(ExtractFilePath(FOpenFileName));
+		// 7-Zip normally provides the volume name.
+		// If it is relative, look for it alongside the first volume.
+		if not TPath.IsPathRooted(FileName) then
+			FileName := BaseDir + FileName;
+
+		FileName := ExpandFileName(FileName);
+		if not FileExists(FileName) then
+		begin
+			// IMPORTANT : l'absence du volume suivant est normal.
+			// Pour RAR4/RAR5 et Split, le handler 7-Zip utilise justement S_FALSE pour dire :
+			// Le volume suivant n'existe pas ; il n'y en a probablement plus.
+			// Donc ici : Result := S_FALSE; est un résultat normal, pas une erreur.
+			Result := S_FALSE;
+			Exit;
+		end;
+
+		inStream := CreateFileInStream(FileName);
+		Result := S_OK;
+
+	except
+		on E: EAbort do
+			Result := E_ABORT;
+		else
+			Result := E_FAIL;
+	end;
 end;
 
 procedure T7zInArchive.SetPasswordCallback(sender: Pointer;
@@ -2190,19 +2671,30 @@ begin
   end;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.ExtractItems(items: PCardArray; count: UInt32; test: longbool;
   sender: pointer; callback: T7zGetStreamCallBack); stdcall;
 begin
-  FExtractCallBack := callback;
-  FExtractSender := sender;
-  try
-    if test then
-      RINOK(FInArchive.Extract(items, count, 1, self as IArchiveExtractCallback)) else
-      RINOK(FInArchive.Extract(items, count, 0, self as IArchiveExtractCallback));
-  finally
-    FExtractCallBack := nil;
-    FExtractSender := nil;
-  end;
+	FExtractCallBack := callback;
+	FExtractSender := sender;
+	ResetCounters;											// Reset result and counters before each extraction
+	try
+		try
+			if test then
+				RINOK(FInArchive.Extract(items, count, 1, self as IArchiveExtractCallback))
+			else
+				RINOK(FInArchive.Extract(items, count, 0, self as IArchiveExtractCallback));
+		finally
+			DeleteFailedFiles;							// Deletes files that have been partially extracted
+		end;
+		CheckOperationResult;
+	finally
+		FExtractCallBack := nil;
+		FExtractSender := nil;
+		FCurrentExtractPath := '';
+	end;
 end;
 
 procedure T7zInArchive.SetProgressCallback(sender: Pointer;
@@ -2212,29 +2704,50 @@ begin
   FProgressCallback := callback;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.ExtractAll(test: longbool; sender: pointer;
   callback: T7zGetStreamCallBack);
 begin
-  FExtractCallBack := callback;
-  FExtractSender := sender;
-  try
-    if test then
-      RINOK(FInArchive.Extract(nil, $FFFFFFFF, 1, self as IArchiveExtractCallback)) else
-      RINOK(FInArchive.Extract(nil, $FFFFFFFF, 0, self as IArchiveExtractCallback));
-  finally
-    FExtractCallBack := nil;
-    FExtractSender := nil;
-  end;
+	FExtractCallBack := callback;
+	FExtractSender := sender;
+	ResetCounters;											// Reset result and counters before each extraction
+	try
+		try
+			if test then
+				RINOK(FInArchive.Extract(nil, $FFFFFFFF, 1, self as IArchiveExtractCallback))
+			else
+				RINOK(FInArchive.Extract(nil, $FFFFFFFF, 0, self as IArchiveExtractCallback));
+		finally
+			DeleteFailedFiles;							// Deletes files that have been partially extracted
+		end;
+		CheckOperationResult;
+	finally
+		FExtractCallBack := nil;
+		FExtractSender := nil;
+		FCurrentExtractPath := '';
+	end;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
 procedure T7zInArchive.ExtractTo(const path: string);
 begin
-  FExtractPath := IncludeTrailingPathDelimiter(path);
-  try
-    RINOK(FInArchive.Extract(nil, $FFFFFFFF, 0, self as IArchiveExtractCallback));
-  finally
-    FExtractPath := '';
-  end;
+	FExtractPath := IncludeTrailingPathDelimiter(path);
+	ResetCounters;											// Reset result and counters before each extraction
+	try
+		try
+			RINOK(FInArchive.Extract(nil, $FFFFFFFF, 0, self as IArchiveExtractCallback));
+		finally
+			DeleteFailedFiles;							// Deletes files that have been partially extracted
+		end;
+		CheckOperationResult;
+	finally
+		FExtractPath := '';
+		FCurrentExtractPath := '';
+	end;
 end;
 
 procedure T7zInArchive.SetPassword(const password: UnicodeString);
@@ -2320,6 +2833,10 @@ begin
   Result := S_OK;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ initial function
+-----------------------------------------------------------------------------
 function T7zStream.GetSize(size: PUInt64): HRESULT;
 begin
   try
@@ -2337,6 +2854,34 @@ begin
   end;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zStream.GetSize(size: PUInt64): HRESULT;
+begin
+	try
+		if size = nil then
+		begin
+			Result := E_INVALIDARG;
+			Exit;
+		end;
+		size^ := FStream.Size;
+		Result := S_OK;
+	except
+		// We must not throw an Delphi exception, because 7z.dll cannot handle it
+		// (the unhandled Delphi Exception will be forwarded as 0x0eedfade and crashes
+		// the calling process without possibility of recovery).
+		on E: EAbort do
+			Result := E_ABORT;
+		else
+			Result := E_FAIL;
+	end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ initial function
+-----------------------------------------------------------------------------
 function T7zStream.Read(data: Pointer; size: UInt32;
   processedSize: PUInt32): HRESULT;
 var
@@ -2356,6 +2901,42 @@ begin
     else
       Result := E_FAIL;
   end;
+end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zStream.Read(data: Pointer; size: UInt32; processedSize: PUInt32): HRESULT;
+var
+	len: Integer;
+begin
+	try
+		if processedSize <> nil then
+			processedSize^ := 0;
+		if size = 0 then
+		begin
+			Result := S_OK;
+			Exit;
+		end;
+		if data = nil then
+		begin
+			Result := E_INVALIDARG;
+			Exit;
+		end;
+
+		len := FStream.Read(data^, size);
+		if processedSize <> nil then
+			processedSize^ := len;
+		Result := S_OK;
+	except
+		// We must not throw an Delphi exception, because 7z.dll cannot handle it
+		// (the unhandled Delphi Exception will be forwarded as 0x0eedfade and crashes
+		// the calling process without possibility of recovery).
+		on E: EAbort do
+			Result := E_ABORT;
+		else
+			Result := E_FAIL;
+	end;
 end;
 
 function T7zStream.Seek(offset: Int64; seekOrigin: UInt32;
@@ -2393,6 +2974,10 @@ begin
   end;
 end;
 
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+ initial function
+-----------------------------------------------------------------------------
 function T7zStream.Write(data: Pointer; size: UInt32;
   processedSize: PUInt32): HRESULT;
 var
@@ -2413,6 +2998,43 @@ begin
       Result := E_FAIL;
   end;
 end;
+
+{ -----------------------------------------------------------------------------
+ 02/09/2026 - CAL
+----------------------------------------------------------------------------- }
+function T7zStream.Write(data: Pointer; size: UInt32; processedSize: PUInt32): HRESULT;
+var
+	len: Integer;
+begin
+	try
+		if processedSize <> nil then
+			processedSize^ := 0;
+		if size = 0 then
+		begin
+			Result := S_OK;
+			Exit;
+		end;
+		if data = nil then
+		begin
+			Result := E_INVALIDARG;
+			Exit;
+		end;
+
+		len := FStream.Write(data^, size);
+		if processedSize <> nil then
+			processedSize^ := len;
+		Result := S_OK;
+	except
+		// We must not throw an Delphi exception, because 7z.dll cannot handle it
+		// (the unhandled Delphi Exception will be forwarded as 0x0eedfade and crashes
+		// the calling process without possibility of recovery).
+		on E: EAbort do
+			Result := E_ABORT;
+		else
+			Result := E_FAIL;
+	end;
+end;
+
 
 type
   TSourceMode = (smStream, smFile);
@@ -2584,6 +3206,8 @@ begin
   FBatchList.Add(item);
 end;
 
+// Clears the list of files/streams queued for the next archive.
+// Does not close the archive object itself.
 procedure T7zOutArchive.ClearBatch;
 begin
   FBatchList.Clear;
@@ -2596,7 +3220,7 @@ begin
   FProgressCallback := nil;
   FProgressSender := nil;
   SetLength(FPropNames, 0);							// CAL - 08/06/2026
-  SetLength(FPropValues, 0);						// CAL - 08/06/2026
+  SetLength(FPropValues, 0);							// CAL - 08/06/2026
 end;
 
 function T7zOutArchive.CryptoGetTextPassword2(passwordIsDefined: PInt32;
@@ -2864,12 +3488,15 @@ begin
 	SetLength(Names, Length(FPropNames));
 	for i:=0 to High(FPropNames) do
 		Names[I] := PWideChar(FPropNames[I]);
-	RINOK(Intf.SetProperties(@Names[0], @FPropValues[0], Length(FPropNames)));
-	// Important! Clean memory:
-	for i:=0 to High(FPropValues) do
-		PropVariantClear(FPropValues[I]);
-	SetLength(FPropNames, 0);
-	SetLength(FPropValues, 0);
+	try
+		RINOK(Intf.SetProperties(@Names[0], @FPropValues[0], Length(FPropNames)));
+	finally
+		// Important! Clean memory:
+		for i:=0 to High(FPropValues) do
+			PropVariantClear(FPropValues[I]);
+		SetLength(FPropNames, 0);
+		SetLength(FPropValues, 0);
+	end;
 end;
 
 function T7zOutArchive.SetTotal(total: UInt64): HRESULT;
