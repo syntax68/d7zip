@@ -3,7 +3,7 @@ object Form1: TForm1
   Top = 0
   Caption = '7-Zip Delphi API test'
   ClientHeight = 565
-  ClientWidth = 776
+  ClientWidth = 700
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
@@ -11,16 +11,17 @@ object Form1: TForm1
   Font.Name = 'Segoe UI'
   Font.Style = []
   OnCreate = FormCreate
+  OnResize = FormResize
   TextHeight = 15
   object Panel1: TPanel
     Left = 0
     Top = 0
-    Width = 776
+    Width = 700
     Height = 121
     Align = alTop
     BevelOuter = bvSpace
     TabOrder = 0
-    ExplicitWidth = 685
+    ExplicitWidth = 776
     object lbSource: TLabel
       Left = 24
       Top = 21
@@ -63,7 +64,7 @@ object Form1: TForm1
     object edNewName: TEdit
       Left = 150
       Top = 52
-      Width = 321
+      Width = 443
       Height = 23
       TabOrder = 1
       Text = 'xx_'
@@ -71,20 +72,29 @@ object Form1: TForm1
     object edFilename: TEdit
       Left = 152
       Top = 18
-      Width = 321
+      Width = 441
       Height = 23
       TabOrder = 0
+    end
+    object btSelect: TButton
+      Left = 608
+      Top = 17
+      Width = 75
+      Height = 25
+      Caption = '&Select'
+      TabOrder = 4
+      OnClick = btSelectClick
     end
   end
   object Panel2: TPanel
     Left = 0
     Top = 121
-    Width = 776
+    Width = 700
     Height = 88
     Align = alTop
     BevelOuter = bvSpace
     TabOrder = 1
-    ExplicitWidth = 685
+    ExplicitWidth = 776
     object Label2: TLabel
       Left = 406
       Top = 48
@@ -146,12 +156,12 @@ object Form1: TForm1
   object Panel3: TPanel
     Left = 0
     Top = 209
-    Width = 776
+    Width = 700
     Height = 88
     Align = alTop
     BevelOuter = bvSpace
     TabOrder = 2
-    ExplicitWidth = 685
+    ExplicitWidth = 776
     object cbFast: TCheckBox
       Left = 40
       Top = 24
@@ -204,18 +214,18 @@ object Form1: TForm1
   object Panel4: TPanel
     Left = 0
     Top = 297
-    Width = 776
+    Width = 700
     Height = 56
     Align = alTop
     BevelOuter = bvSpace
     TabOrder = 3
-    ExplicitWidth = 685
+    ExplicitWidth = 776
     object btAction: TButton
       Left = 16
       Top = 16
       Width = 137
       Height = 25
-      Caption = 'Action'
+      Caption = 'Compress'
       TabOrder = 0
       OnClick = btActionClick
     end
@@ -241,12 +251,16 @@ object Form1: TForm1
   object Memo1: TMemo
     Left = 0
     Top = 353
-    Width = 776
+    Width = 700
     Height = 212
     Align = alClient
     BevelInner = bvNone
     ScrollBars = ssBoth
     TabOrder = 4
-    ExplicitWidth = 685
+    ExplicitWidth = 776
+  end
+  object OpenDialog1: TOpenDialog
+    Left = 632
+    Top = 64
   end
 end

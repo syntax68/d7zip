@@ -3,7 +3,7 @@ unit Unit1;
 interface
 
 uses WinApi.Windows, System.Classes, System.SysUtils, System.IOUtils,
-	Vcl.Forms, Vcl.StdCtrls, Vcl.Controls, Vcl.ExtCtrls, sevenzip;
+	Vcl.Forms, Vcl.StdCtrls, Vcl.Controls, Vcl.ExtCtrls, sevenzip, Vcl.Dialogs;
 
 const
 	TextCompressMethod: array[0..5] of string=('deflate','deflate64','PPMd','LZMA','LZMA2','BZip2');
@@ -37,10 +37,14 @@ type
 	 btStop: TButton;
 	 Label2: TLabel;
 	 edFilename: TEdit;
+    btSelect: TButton;
+    OpenDialog1: TOpenDialog;
 	 procedure FormCreate(Sender: TObject);
 	 procedure btQuitClick(Sender: TObject);
 	 procedure btStopClick(Sender: TObject);
 	 procedure btActionClick(Sender: TObject);
+    procedure btSelectClick(Sender: TObject);
+    procedure FormResize(Sender: TObject);
   private
 	 selcompr:integer;		// 0=zip; 1=7z
 	 selmethod:integer;		// 0=deflate, 1=deflate64, 2=PPMd, 3=LZMA, 4=LZMA2, 5=BZip2
@@ -88,11 +92,31 @@ begin
 end;
 
 { -----------------------------------------------------------------------------
+ 24/09/2026
+----------------------------------------------------------------------------- }
+procedure TForm1.FormResize(Sender: TObject);
+begin
+	btSelect.Left:=self.width-109;
+	edFilename.Width:=btSelect.left-edFilename.left-15;
+	edNewName.Width:=edFilename.Width;
+end;
+
+{ -----------------------------------------------------------------------------
  08/06/2026
 ----------------------------------------------------------------------------- }
 procedure TForm1.btQuitClick(Sender: TObject);
 begin
 	close;
+end;
+
+{ -----------------------------------------------------------------------------
+ 24/09/2026
+----------------------------------------------------------------------------- }
+procedure TForm1.btSelectClick(Sender: TObject);
+begin
+	OpenDialog1.InitialDir:=extractfilepath(edFilename.Text);
+	OpenDialog1.Execute;
+	edFilename.Text:=OpenDialog1.FileName;
 end;
 
 { -----------------------------------------------------------------------------
