@@ -6,16 +6,19 @@
 * Version: 1.2
 * [Original source at Google Code](https://code.google.com/archive/p/d7zip/source/default/commits)
 * Extended version by Daniel Marschall 2024-05-15 with a lot of changes (see sevenzip.pas header for changelog)
+* Extended version by Christian Allen 2026 (see sevenzip.pas header for changelog)
 * Example usage Demo added by Geoffrey Smith
+* Example usage Demo2 and Demo3 added by Christian Allen
 
-This API use the 7-zip dll (7z.dll) to read and write all 7-zip supported archive formats.  The latest 32-bit and 64-bit version of the 7z.dll is included in the repository (currently 24.08). According to the documentation, file formats listed below are supported, although many may only support decompression/extraction and not creation/compression.
+This API use the 7-zip dll (7z.dll) to read and write all 7-zip supported archive formats.  The latest 64-bit version of the 7z.dll is included in the repository (currently 26.03). According to the documentation, file formats listed below are supported, although many may only support decompression/extraction and not creation/compression.
  - zip
  - bz2
- - rar
+ - rar (RAR4 and RAR5, single file and multi-volumes)
  - arj
  - z
  - lzh
  - 7z
+ - 7z.001 (multi-volumes 7-Zip file)
  - cab
  - nsis
  - lzma
@@ -56,10 +59,12 @@ This API use the 7-zip dll (7z.dll) to read and write all 7-zip supported archiv
 ## 7-Zip Demo
   This demo currently allows you to locate archives on your hard disk and list the contents of archive. It uses VirtualTree that you can get in the GetIt package manager in Delphi.
 
-  
+## additional demo
+- demo2 to test compression
+- demo3 to test decompression
+
 ## Reading archive:
 ### Extract to path:
-
 ```pascal
 var
   archive : I7zInArchive;
@@ -68,8 +73,8 @@ begin
   archive.OpenFile('c:\test.zip');
   archive.ExtractTo('c:\test');
 end;
-
 ```
+
 ### Get file list:
 ```Pascal
 var
@@ -83,6 +88,7 @@ begin
       Writeln(archive.ItemPath[i]);
 end;
 ```
+
 ### Extract to stream
 ```Pascal
  with CreateInArchive(CLSID_CFormat7z) do
@@ -93,6 +99,7 @@ end;
        ExtractItem(i, stream, false);
  end;
 ```
+
 ### Extract "n" Items
 ```Pascal
 function GetStreamCallBack(sender: Pointer; index: Cardinal;
@@ -117,8 +124,8 @@ begin
   items[2] := 2;
   archive.ExtractItems(@items, Length(items), false, nil, GetStreamCallBack);
 end;
-
 ```
+
 ### Open stream
 ```Pascal
 var
@@ -130,6 +137,7 @@ begin
    ...
 end;
 ```
+
 ### Progress bar
 ```Pascal
 function ProgressCallback(sender: Pointer; total: boolean; value: int64): HRESULT; stdcall;
@@ -151,6 +159,7 @@ begin
   ...
 end;
 ```
+
 ### Password
 ```Pascal
 function PasswordCallback(sender: Pointer; var password: WideString): HRESULT; stdcall;
@@ -173,6 +182,3 @@ begin
      ...
 end;
 ```
-### Writing archive
-see Demo2
-
